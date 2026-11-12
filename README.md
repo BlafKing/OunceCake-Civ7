@@ -22,7 +22,7 @@ This tool has been tested with [civswitch-kit](https://gitee.com/mza1010/civswit
 git clone https://github.com/BlafKing/OunceCake-Civ7.git
 ```
 
-2. Use [civswitch-kit](https://gitee.com/mza1010/civswitch-kit/) to get an RPC connection with the system. Use `node run.cjs --rpc`.
+2. Use [civswitch-kit](https://gitee.com/mza1010/civswitch-kit/) to get an RPC connection with the system.
 
 <details>
 <summary>How to use civswitch-kit</summary>
