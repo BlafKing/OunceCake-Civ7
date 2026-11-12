@@ -7,16 +7,28 @@ const path = require('node:path');
 const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 
+function findTool(names) {
+  for (const name of names) {
+    for (const directory of (process.env.PATH || '').split(path.delimiter)) {
+      const file = path.join(directory, name);
+      try {
+        fs.accessSync(file, fs.constants.X_OK);
+        return file;
+      } catch {}
+    }
+  }
+  throw new Error('Missing build tool: ' + names.join(' or '));
+}
+
 function main() {
   const directory = path.join(__dirname, 'oz-code');
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'ns2-ftp-build-'));
   try {
-    const object = path.join(temporary, 'native.o');
-    const elf = path.join(temporary, 'native.elf');
-    const binary = path.join(temporary, 'native.bin');
-    execFileSync(
-      'aarch64-linux-gnu-gcc',
-      [
+    const gcc = (() => { try { return findTool(['aarch64-linux-gnu-gcc']); } catch { return null; } })();
+    const compiler = gcc || findTool(['clang']);
+    const linker = gcc ? findTool(['aarch64-linux-gnu-ld']) : findTool(['ld.lld']);
+    const objcopy = gcc ? findTool(['aarch64-linux-gnu-objcopy']) : findTool(['llvm-objcopy']);
+    const common = [
         '-c',
         '-Os',
         '-ffreestanding',
@@ -29,18 +41,26 @@ function main() {
         '-ffunction-sections',
         '-mgeneral-regs-only',
         '-mno-outline-atomics',
-        path.join(directory, 'native.c'),
-        '-o',
-        object,
-      ],
-      { stdio: 'inherit' },
-    );
-    execFileSync('aarch64-linux-gnu-ld', ['-T', path.join(directory, 'layout.ld'), object, '-o', elf], {
+        '-Wall',
+        '-Wextra',
+        '-Werror',
+    ];
+
+    const object = path.join(temporary, 'native-civ7.o');
+    const elf = path.join(temporary, 'native-civ7.elf');
+    const binary = path.join(temporary, 'native-civ7.bin');
+    execFileSync(compiler, [
+      ...(!gcc ? ['--target=aarch64-linux-gnu'] : []),
+      ...common,
+      path.join(directory, 'native.c'),
+      '-o', object,
+    ], { stdio: 'inherit' });
+    execFileSync(linker, ['-T', path.join(directory, 'layout-civ7.ld'), object, '-o', elf], {
       stdio: 'inherit',
     });
 
-    execFileSync('aarch64-linux-gnu-objcopy', ['-O', 'binary', elf, binary], { stdio: 'inherit' });
-    fs.copyFileSync(binary, path.join(directory, 'native.bin'));
+    execFileSync(objcopy, ['-O', 'binary', elf, binary], { stdio: 'inherit' });
+    fs.copyFileSync(binary, path.join(directory, 'native-civ7.bin'));
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }

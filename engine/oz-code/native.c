@@ -1,5 +1,4 @@
-// read only ftp, pushed to the switch 2
-// eats the stuff (sdk functions etc.) smilebasic has
+// Civ7 read-only FTP payload for Switch 2.
 #include "native.h"
 #define NONE 0xffffffffu
 #define BAD 0xd401u
@@ -8,6 +7,23 @@
 #define PATH_BYTES 1024
 #define NONBLOCK 0x800
 #define DONTWAIT 0x80
+#define TRANSFER_BATCH_SLICES 32
+
+enum {
+    DIAG_NONE=0,
+    DIAG_REPLY_HANDLES=1,
+    DIAG_DOMAIN_HEADER=2,
+    DIAG_MISSING_SFCO=3,
+    DIAG_CMIF_RESULT=4,
+    DIAG_REPLY_EXTENT=5,
+    DIAG_CHILD_OBJECT=6,
+    DIAG_UNEXPECTED_CHILD=7,
+    DIAG_SHORT_FILE_READ=8,
+    DIAG_OPEN_CHILD=9,
+    DIAG_OPEN_TRANSPORT=10,
+    DIAG_READ_TRANSPORT=11,
+    DIAG_CLOSE_TRANSPORT=12,
+};
 
 void *memset(void *p, int value, __SIZE_TYPE__ n) {u8 *b=p; for (__SIZE_TYPE__ i=0;i<n;i++) b[i]=(u8)value; return p;}
 void *memcpy(void *p, const void *q, __SIZE_TYPE__ n) {u8 *a=p;const u8 *b=q;for (__SIZE_TYPE__ i=0;i<n;i++) a[i]=b[i];return p;}
@@ -37,18 +53,20 @@ typedef struct {
     u32 line_bytes;
 } Client;
 typedef struct {
-    FtpConfig config;
-    Server server;
-    u64 thread;
-    volatile u32 running;
-    int control;
-    Address peer;
-} ClientSlot;
-_Static_assert(sizeof(ClientSlot)<=4096, "client slot ABI");
+    u32 active, node;
+    int data;
+    u32 padding;
+    u64 offset;
+} Transfer;
+typedef struct {
+    Client client;
+    Transfer transfer;
+    u32 active;
+} CivClientSlot;
+_Static_assert(sizeof(CivClientSlot)<=4096, "Civ7 client slot ABI");
 static int io_enter(FtpConfig *c) {
-    FtpConfig *owner=c->owner?(FtpConfig *)c->owner:c;
     while(!c->stop) {
-        if(!__atomic_exchange_n(&owner->io_lock,1,__ATOMIC_ACQUIRE))return 1;
+        if(!__atomic_exchange_n(&c->io_lock,1,__ATOMIC_ACQUIRE))return 1;
         // one complete open/read/close at a time, without waiting on a network client
         PollFd delay={-1,0,0};
         c->functions->poll(&delay,1,1);
@@ -56,11 +74,26 @@ static int io_enter(FtpConfig *c) {
     return 0;
 }
 static void io_leave(FtpConfig *c) {
-    FtpConfig *owner=c->owner?(FtpConfig *)c->owner:c;
-    __atomic_store_n(&owner->io_lock,0,__ATOMIC_RELEASE);
+    __atomic_store_n(&c->io_lock,0,__ATOMIC_RELEASE);
 }
 static u32 ipc_call(FtpConfig *c,u32 handle) {
+    // Civ7's verified Switch 2 SDK wrapper uses the user-buffer IPC ABI. This
+    // is also the exact calling convention used by the connector's working
+    // JavaScript IPC path: command buffer, buffer size, session handle.
     return c->functions->ipc(c->ipc_buffer,4096,handle);
+}
+
+static void trace_begin(FtpConfig *c,u32 phase) {
+    c->phase=phase;c->diagnostic=DIAG_NONE;c->packet0=0;c->packet1=0;
+    c->packet_at=0;c->packet_word=0;c->expected=0;c->actual=0;c->native_result=0;
+}
+static u8 *trace_failure(FtpConfig *c,u32 diagnostic,u32 *p,u32 at) {
+    c->diagnostic=diagnostic;
+    if(p) {
+        c->packet0=p[0];c->packet1=p[1];c->packet_at=at*4;
+        if(at<64)c->packet_word=p[at];
+    }
+    return 0;
 }
 
 static int wait_fd(FtpConfig *c,int fd,short events,int attempts) {
@@ -292,16 +325,16 @@ static u8 *response(FtpConfig *c,FsObject parent,u32 data_bytes,FsObject *child)
     if(p[1]>>31) {
         u32 special=p[at++],copies=(special>>1)&15,moves=(special>>5)&15;
         if(special&1)at+=2;
-        if(copies||moves>1||(parent.object_id&&moves))return 0;
+        if(copies||moves>1||(parent.object_id&&moves))return trace_failure(c,DIAG_REPLY_HANDLES,p,at);
         if(moves)moved=p[at++];
     }
     at+=((p[0]>>16)&15)*2+(((p[0]>>20)&15)+((p[0]>>24)&15)+((p[0]>>28)&15))*3;at=(at+3)&~3u;
-    if(parent.object_id) {if(at+4>64)return 0;objects=p[at];at+=4;}
-    if(at+4>64||p[at]!=0x4f434653)return 0;
-    if(p[at+2]) {c->native_result=p[at+2];return 0;}
-    if(at*4+16+data_bytes+(u64)objects*4>256||objects>1)return 0;
+    if(parent.object_id) {if(at+4>64)return trace_failure(c,DIAG_DOMAIN_HEADER,p,at);objects=p[at];at+=4;}
+    if(at+4>64||p[at]!=0x4f434653)return trace_failure(c,DIAG_MISSING_SFCO,p,at);
+    if(p[at+2]) {c->native_result=p[at+2];return trace_failure(c,DIAG_CMIF_RESULT,p,at);}
+    if(at*4+16+data_bytes+(u64)objects*4>256||objects>1)return trace_failure(c,DIAG_REPLY_EXTENT,p,at);
     if(objects) {
-        u32 id=*(u32 *)((u8 *)(p+at+4)+data_bytes);if(!id)return 0;
+        u32 id=*(u32 *)((u8 *)(p+at+4)+data_bytes);if(!id)return trace_failure(c,DIAG_CHILD_OBJECT,p,at);
         *child=(FsObject){parent.handle,id};
     } else if(moved)*child=(FsObject){moved,0};
     return (u8 *)(p+at+4);
@@ -316,12 +349,16 @@ static int close_reader_object(FtpConfig *c,FsObject object) {
     int ok=!close_object(c,object);io_leave(c);return ok;
 }
 static FsObject open_path(FtpConfig *c,FsObject parent,u32 command,const void *input,u32 input_bytes,const char *filename) {
+    trace_begin(c,0x100);
     u8 *name=c->ipc_buffer+4096;
     u64 bytes=length(filename);if(bytes>0x300)return (FsObject){0};memset(name,0,0x301);memcpy(name,filename,bytes);
     packet(c,parent,command,input,input_bytes,0,0);u32 *p=(u32 *)c->ipc_buffer;u64 a=(u64)name;
     p[0]=4|1u<<16;p[2]=(0x301u<<16)|((u32)((a>>36)&7)<<6)|((u32)((a>>32)&15)<<12);p[3]=(u32)a;
-    c->native_result=ipc_call(c,parent.handle);if(c->native_result)return (FsObject){0};
+    c->native_result=ipc_call(c,parent.handle);if(c->native_result) {c->diagnostic=DIAG_OPEN_TRANSPORT;return (FsObject){0};}
+    c->phase=0x101;
     FsObject object;if(!response(c,parent,0,&object))return (FsObject){0};
+    if(!object.handle) {c->diagnostic=DIAG_OPEN_CHILD;return (FsObject){0};}
+    c->phase=0x102;
     return object;
 }
 static FsObject open_source(Server *s,const Node *n) {
@@ -347,11 +384,19 @@ static FsObject open_source(Server *s,const Node *n) {
     return object;
 }
 static int read_storage(Server *s,FsObject object,int file,u64 offset,u32 count) {
-    FtpConfig *c=s->c;u64 input[3]={file?0:offset,file?offset:count,count};
+    FtpConfig *c=s->c;trace_begin(c,0x200);c->expected=count;
+    u64 input[3]={file?0:offset,file?offset:count,count};
     packet(c,object,0,input,file?24:16,c->data,count);
-    c->native_result=ipc_call(c,object.handle);if(c->native_result)return 0;
-    FsObject child;u8 *out=response(c,object,file?8:0,&child);if(!out||child.handle)return 0;
-    if(file&&*(u64 *)out!=count)return 0;
+    c->native_result=ipc_call(c,object.handle);if(c->native_result) {c->diagnostic=DIAG_READ_TRANSPORT;return 0;}
+    c->phase=0x201;
+    FsObject child;u8 *out=response(c,object,file?8:0,&child);if(!out)return 0;
+    if(child.handle) {c->diagnostic=DIAG_UNEXPECTED_CHILD;return 0;}
+    c->phase=0x202;
+    if(file) {
+        c->actual=*(u64 *)out;
+        if(c->actual!=count) {c->diagnostic=DIAG_SHORT_FILE_READ;return 0;}
+    }
+    c->phase=0x203;
     return 1;
 }
 static int read_source(Server *s,const Node *n,u64 offset,u32 count) {
@@ -359,53 +404,75 @@ static int read_source(Server *s,const Node *n,u64 offset,u32 count) {
     if(!io_enter(c))return 0;
     FsObject object=source->kind?open_source(s,n):source_object(source);
     int ok=object.handle&&read_storage(s,object,source->kind==1||source->kind==3,offset,count);
-    if(source->kind&&object.handle&&close_object(c,object))ok=0;
+    if(source->kind&&object.handle) {
+        u32 result=close_object(c,object);
+        if(result) {c->native_result=result;c->diagnostic=DIAG_CLOSE_TRANSPORT;ok=0;}
+    }
     io_leave(c);return ok;
 }
 #include "tar.h"
+static CivClientSlot *civ_slot(FtpConfig *c,u32 index) {
+    return (CivClientSlot *)(c->slots+(u64)index*c->slot_bytes);
+}
+static void transfer_close(Client *p) {
+    CivClientSlot *slot=(CivClientSlot *)p;
+    if(slot->transfer.active)p->server->c->functions->close(slot->transfer.data);
+    memset(&slot->transfer,0,sizeof(slot->transfer));
+}
+static int transfer_active(FtpConfig *c) {
+    for(u32 i=0;i<c->reserved;i++)if(civ_slot(c,i)->transfer.active)return 1;
+    return 0;
+}
+static int transfer_finish(Client *p,int ok) {
+    FtpConfig *c=p->server->c;transfer_close(p);
+    if(ok) {c->files++;return reply(p,"226 Transfer complete\r\n");}
+    return reply(p,"426 Transfer interrupted\r\n");
+}
+// Continue one bounded piece of a transfer, then return to the connector. The
+// data socket and 64-bit offset live in the persistent client slot, so files
+// and generated tar archives have no duration or size limit imposed by one
+// native RPC call.
+static int transfer_step(Server *s,CivClientSlot *slot) {
+    FtpConfig *c=s->c;Transfer *t=&slot->transfer;Client *p=&slot->client;
+    if(!t->active||t->node>=s->count)return transfer_finish(p,0);
+    const Node *n=s->nodes+t->node;
+    if(t->offset>=n->size)return transfer_finish(p,t->offset==n->size);
+    if(n->type==NODE_TAR) {
+        u64 next=t->offset;
+        int result=tar_transfer_slice(s,n,t->data,t->offset,c->data_bytes,&next);
+        if(!result||next<=t->offset)return transfer_finish(p,0);
+        t->offset=next;
+        return result==2?transfer_finish(p,1):1;
+    }
+    u64 count=n->size-t->offset;if(count>c->data_bytes)count=c->data_bytes;
+    const Source *source=c->sources+n->mount;
+    u64 at=(source->kind==0||source->kind==2)?n->offset+t->offset:t->offset;
+    if(!read_source(s,n,at,(u32)count)||!send_all(c,t->data,c->data,count,1))
+        return transfer_finish(p,0);
+    t->offset+=count;
+    return t->offset==n->size?transfer_finish(p,1):1;
+}
 static int retrieve(Client *p,const char *name) {
     if(!p->binary) {
         passive_close(p);p->restart=0;
         return reply(p,"503 Downloading in ASCII mode forbidden. Set your client to TYPE I (ASCII) first\r\n");
     }
-    Server *s=p->server;FtpConfig *c=s->c;u32 id=lookup(p,name);u64 restart=p->restart;p->restart=0;
+    Server *s=p->server;u32 id=lookup(p,name);u64 restart=p->restart;p->restart=0;
     if(id==NONE||!s->nodes[id].type)return reply(p,"550 No such file\r\n");
-    const Node *n=s->nodes+id;const Source *source=c->sources+n->mount;
+    const Node *n=s->nodes+id;
     if(restart>n->size)return reply(p,"551 Restart offset exceeds file size\r\n");
     if(p->passive<0)return reply(p,"425 Use PASV or EPSV first\r\n");
+    CivClientSlot *slot=(CivClientSlot *)p;
+    if(slot->transfer.active) {passive_close(p);return reply(p,"450 Transfer already in progress\r\n");}
     if(!reply(p,"150 Opening binary data connection\r\n"))return 0;
-    int fd=data_accept(p),ok=fd>=0;u64 offset=restart;
-    if(n->type==NODE_TAR) {
-        if(ok)ok=tar_transfer(s,n,fd,restart);
-        if(ok)offset=n->size;
-    }
-    if(source->kind==1||source->kind==3)s->cache_source=NONE;
-    while(n->type!=NODE_TAR&&ok&&offset<n->size&&!c->stop) {
-        u64 count,inside=0;
-        if(source->kind==1||source->kind==3) {
-            count=n->size-offset;if(count>c->data_bytes)count=c->data_bytes;
-            ok=read_source(s,n,offset,(u32)count);
-        } else {
-            u64 at=n->offset+offset,start=(at/c->data_bytes)*c->data_bytes;
-            if(s->cache_source!=n->mount||s->cache_offset!=start) {
-                s->cache_source=NONE;
-                count=source->size-start;if(count>c->data_bytes)count=c->data_bytes;
-                ok=read_source(s,n,start,(u32)count);if(!ok)break;
-                s->cache_source=n->mount;s->cache_offset=start;s->cache_bytes=count;
-            }
-            inside=at-s->cache_offset;count=s->cache_bytes-inside;if(count>n->size-offset)count=n->size-offset;
-        }
-        if(ok)ok=send_all(c,fd,c->data+inside,count,1);
-        offset+=count;
-    }
-    if(fd>=0)c->functions->close(fd);
-    if(ok&&offset==n->size&&!c->stop) {c->files++;return reply(p,"226 Transfer complete\r\n");}
-    return reply(p,fd<0?"425 Data connection unavailable\r\n":"426 Transfer interrupted\r\n");
+    int fd=data_accept(p);if(fd<0)return reply(p,"425 Data connection unavailable\r\n");
+    slot->transfer=(Transfer){1,id,fd,0,restart};
+    return 1;
 }
 static int command(Client *p,char *line) {
     char *name=line;while(*line&&*line!=' ') {if(*line>='a'&&*line<='z')*line-=32;line++;}
     char *arg=line;if(*line) {*line++=0;arg=line;}
-    if(equal(name,"QUIT")) {reply(p,"221 Goodbye\r\n");return 0;}
+    if(equal(name,"QUIT")) {transfer_close(p);reply(p,"221 Goodbye\r\n");return 0;}
     if(equal(name,"NOOP"))return reply(p,"200 OK\r\n");
     if(equal(name,"SYST"))return reply(p,"215 UNIX Type: L8\r\n");
     if(equal(name,"FEAT"))return reply(p,"211-Features\r\n EPSV\r\n PASV\r\n SIZE\r\n MDTM\r\n MLST type*;size*;modify*;perm*;\r\n REST STREAM\r\n UTF8\r\n211 End\r\n");
@@ -441,93 +508,120 @@ static int command(Client *p,char *line) {
         return equal(name,"SIZE")?numeric_reply(p,"213 ",p->server->nodes[id].size):reply(p,"213 19700101000000\r\n");
     }
     if(equal(name,"RETR"))return retrieve(p,arg);
-    if(equal(name,"ABOR")) {passive_close(p);p->restart=0;return reply(p,"226 No transfer active\r\n");}
+    if(equal(name,"ABOR")) {
+        int active=((CivClientSlot *)p)->transfer.active;
+        transfer_close(p);passive_close(p);p->restart=0;
+        return reply(p,active?"226 Transfer aborted\r\n":"226 No transfer active\r\n");
+    }
     return reply(p,"550 Read-only server or unsupported command\r\n");
 }
-static void session(Server *s,int fd,Address peer) {
-    Client p;memset(&p,0,sizeof(p));p.server=s;p.control=fd;p.passive=-1;p.peer=peer;
-    u32 size=16;if(s->c->functions->sockname(fd,&p.local,&size)||size!=16)return;
-    memcpy(s->c->ip,&p.local.address,4);
-    if(!reply(&p,"220 Selected game read-only FTP\r\n"))return;
-    char input[512];u32 idle=0;int ok=1;
-    while(ok&&!s->c->stop&&idle<3000) {
-        int ready=wait_fd(s->c,fd,1,1);if(ready<0)break;if(!ready) {idle++;continue;}
-        s64 count=s->c->functions->recv(fd,input,sizeof(input),DONTWAIT);
-        if(count<0&&transient(s->c))continue;
-        if(count<=0||count>(s64)sizeof(input))break;
-        idle=0;
-        for(s64 i=0;i<count&&ok;i++) {
-            u8 b=(u8)input[i];
-            if(!b||b==255) {reply(&p,"500 Invalid command encoding\r\n");ok=0;break;}
-            if(b=='\n') {
-                if(p.line_bytes&&p.line[p.line_bytes-1]=='\r')p.line_bytes--;
-                p.line[p.line_bytes]=0;ok=command(&p,p.line);p.line_bytes=0;
-            } else if(p.line_bytes==PATH_BYTES) {reply(&p,"500 Command too long\r\n");ok=0;}
-            else p.line[p.line_bytes++]=(char)b;
+static int client_start(Server *s,Client *p,int fd,Address peer) {
+    memset(p,0,sizeof(*p));p->server=s;p->control=fd;p->passive=-1;p->peer=peer;
+    u32 size=16;if(s->c->functions->sockname(fd,&p->local,&size)||size!=16)return 0;
+    memcpy(s->c->ip,&p->local.address,4);
+    return reply(p,"220 Selected game read-only FTP\r\n");
+}
+static int client_receive(Client *p) {
+    char input[512];int ok=1;FtpConfig *c=p->server->c;
+    s64 count=c->functions->recv(p->control,input,sizeof(input),DONTWAIT);
+    if(count<0&&transient(c))return 1;
+    if(count<=0||count>(s64)sizeof(input))return 0;
+    for(s64 i=0;i<count&&ok;i++) {
+        u8 b=(u8)input[i];
+        if(!b||b==255) {reply(p,"500 Invalid command encoding\r\n");ok=0;break;}
+        if(b=='\n') {
+            if(p->line_bytes&&p->line[p->line_bytes-1]=='\r')p->line_bytes--;
+            p->line[p->line_bytes]=0;ok=command(p,p->line);p->line_bytes=0;
+        } else if(p->line_bytes==PATH_BYTES) {reply(p,"500 Command too long\r\n");ok=0;}
+        else p->line[p->line_bytes++]=(char)b;
+    }
+    return ok;
+}
+static void client_finish(Client *p) {transfer_close(p);passive_close(p);}
+static void civ_client_close(Server *s,CivClientSlot *slot) {
+    if(!slot->active)return;
+    slot->client.server=s;client_finish(&slot->client);
+    s->c->functions->close(slot->client.control);
+    memset(slot,0,sizeof(*slot));s->c->closed_sessions++;
+}
+static void civ_clients_close(Server *s) {
+    for(u32 i=0;i<s->c->reserved;i++)civ_client_close(s,civ_slot(s->c,i));
+}
+static int civ_persistent_slice(Server *s,int listener) {
+    FtpConfig *c=s->c;FtpFunctions *f=c->functions;
+    u32 transfer_slices=0;
+    for(u32 i=0;i<c->reserved;i++)if(civ_slot(c,i)->active)civ_slot(c,i)->client.server=s;
+    for(u32 tick=0;tick<150&&!c->stop;tick++) {
+        PollFd polls[FTP_MAX_CLIENTS+1];u32 slots[FTP_MAX_CLIENTS+1];u32 count=1;
+        polls[0]=(PollFd){listener,1,0};slots[0]=NONE;
+        for(u32 i=0;i<c->reserved;i++) {
+            CivClientSlot *slot=civ_slot(c,i);if(!slot->active)continue;
+            polls[count]=(PollFd){slot->client.control,1,0};slots[count++]=i;
+        }
+        // Do not add a 100 ms idle wait to every 4 MiB transfer slice. Active
+        // transfers still poll control sockets, but do so non-blockingly.
+        int ready=f->poll(polls,count,transfer_active(c)?0:100);
+        if(ready<0) {if(transient(c))continue;return 0;}
+        if(polls[0].revents&0x38)return 0;
+        if(polls[0].revents&1) {
+            Address peer={0};u32 bytes=16;int fd=f->accept(listener,&peer,&bytes);
+            if(fd>=0) {
+                CivClientSlot *free_slot=0;
+                for(u32 i=0;i<c->reserved;i++)if(!civ_slot(c,i)->active) {free_slot=civ_slot(c,i);break;}
+                if(bytes!=16||peer.family!=2||!free_slot) {
+                    send_all(c,fd,"421 Server busy\r\n",17,0);f->close(fd);
+                } else if(client_start(s,&free_slot->client,fd,peer)) {
+                    free_slot->active=1;c->sessions++;
+                } else f->close(fd);
+            }
+        }
+        for(u32 i=1;i<count;i++) {
+            CivClientSlot *slot=civ_slot(c,slots[i]);if(!slot->active)continue;
+            int keep=1;
+            if(polls[i].revents&0x38)keep=0;
+            else if(polls[i].revents&1)keep=client_receive(&slot->client);
+            if(!keep)civ_client_close(s,slot);
+        }
+        // The data buffer is shared, so pump one client slice at a time and
+        // round-robin between active transfers. Keep a bounded batch inside
+        // this native call: returning after every 4 MiB slice made each slice
+        // pay for a host RPC renewal and status read, cutting throughput by
+        // more than half. A 128 MiB batch remains far below the connector
+        // deadline while amortizing that fixed overhead.
+        for(u32 step=0;step<c->reserved;step++) {
+            u32 i=(c->transfer_cursor+step)%c->reserved;
+            CivClientSlot *slot=civ_slot(c,i);if(!slot->active||!slot->transfer.active)continue;
+            c->transfer_cursor=(i+1)%c->reserved;
+            if(!transfer_step(s,slot))civ_client_close(s,slot);
+            if(++transfer_slices>=TRANSFER_BATCH_SLICES)return 1;
+            break;
         }
     }
-    passive_close(&p);
-}
-static void *client_worker(void *argument) {
-    ClientSlot *slot=argument;
-    session(&slot->server,slot->control,slot->peer);
-    slot->config.functions->close(slot->control);
-    __atomic_store_n(&slot->running,0,__ATOMIC_RELEASE);
-    return 0;
-}
-static void collect_clients(FtpConfig *c,int stop) {
-    u64 sent=0,files=0;
-    for(u32 i=0;i<c->reserved;i++) {
-        ClientSlot *slot=(ClientSlot *)(c->slots+i*c->slot_bytes);
-        if(stop)slot->config.stop=1;
-        if(slot->thread&&!__atomic_load_n(&slot->running,__ATOMIC_ACQUIRE)) {
-            if(c->functions->thread_join(slot->thread,0))c->result=BAD;
-            else slot->thread=0;
-        }
-        sent+=slot->config.sent;files+=slot->config.files;
-        if(slot->config.native_result)c->native_result=slot->config.native_result;
-        if(slot->config.ip[0])memcpy(c->ip,slot->config.ip,4);
-    }
-    c->sent=sent;c->files=files;
+    return 1;
 }
 void *ftp_main(void *configuration) {
     FtpConfig *c=configuration;
     if(!c||c->magic!=CFG_MAGIC||c->version!=2)return (void *)(u64)BAD;
-    Server s;memset(&s,0,sizeof(s));s.c=c;s.cache_source=NONE;c->state=0;c->result=BAD;
+    Server s;memset(&s,0,sizeof(s));s.c=c;s.cache_source=NONE;c->state=0;c->result=BAD;trace_begin(c,0);
     if(!c->functions||!c->ipc_buffer||!c->data||c->data_bytes<4096||c->data_bytes>0x400000||
-        !c->port||c->port>65535||!c->slots||!c->reserved||c->reserved>FTP_MAX_CLIENTS||
+        !c->port||c->port>65535||!c->reserved||c->reserved>FTP_MAX_CLIENTS||
         (c->output_bytes&&c->output_bytes!=TAR_OUTPUT_BYTES)||
-        c->slot_bytes<4096+c->data_bytes+8192+c->output_bytes||!index_valid(&s)||
+        !c->slots||c->slot_bytes<sizeof(CivClientSlot)||
+        !index_valid(&s)||
         (s.member_count&&c->output_bytes!=TAR_OUTPUT_BYTES)) {c->state=3;return (void *)(u64)BAD;}
-    for(u32 i=0;i<c->reserved;i++)memset(c->slots+i*c->slot_bytes,0,sizeof(ClientSlot));
-    FtpFunctions *f=c->functions;int fd=f->socket(2,1,0);
-    if(fd<0) {c->state=3;return (void *)(u64)BAD;}
-    Address address={16,2,swap16((u16)c->port),0,{0}};
-    if(f->bind(fd,&address,16)||f->listen(fd,(int)c->reserved)) {f->close(fd);c->state=3;return (void *)(u64)BAD;}
-    c->result=0;c->state=1;
-    while(!c->stop) {
-        collect_clients(c,0);
-        int ready=wait_fd(c,fd,1,1);if(ready<0) {c->result=BAD;break;}if(!ready)continue;
-        Address peer={0};u32 bytes=16;int client=f->accept(fd,&peer,&bytes);
-        if(client<0)continue;
-        ClientSlot *slot=0;
-        for(u32 i=0;i<c->reserved;i++) {
-            ClientSlot *candidate=(ClientSlot *)(c->slots+i*c->slot_bytes);
-            if(!candidate->thread) {slot=candidate;break;}
-        }
-        if(bytes!=16||peer.family!=2||!slot) {send_all(c,client,"421 Server busy\r\n",17,0);f->close(client);continue;}
-        u64 sent=slot->config.sent,files=slot->config.files;
-        memcpy(&slot->config,c,sizeof(*c));slot->config.sent=sent;slot->config.files=files;slot->config.owner=(struct FtpConfigTag *)c;
-        slot->config.data=(u8 *)slot+4096;slot->config.ipc_buffer=slot->config.data+c->data_bytes;
-        slot->server=s;slot->server.c=&slot->config;slot->server.cache_source=NONE;slot->control=client;slot->peer=peer;slot->running=1;
-        if(f->thread_create(&slot->thread,0,client_worker,slot)) {slot->running=0;slot->thread=0;f->close(client);}
+    FtpFunctions *f=c->functions;int fd=c->listener_fd;
+    if(fd<0) {
+        fd=f->socket(2,1,0);
+        if(fd<0) {c->state=3;return (void *)(u64)BAD;}
+        Address address={16,2,swap16((u16)c->port),0,{0}};
+        if(f->bind(fd,&address,16)||f->listen(fd,(int)c->reserved)) {f->close(fd);c->state=3;return (void *)(u64)BAD;}
+        c->listener_fd=fd;
     }
-    f->close(fd);
-    for(;;) {
-        collect_clients(c,1);int active=0;
-        for(u32 i=0;i<c->reserved;i++)if(((ClientSlot *)(c->slots+i*c->slot_bytes))->thread)active=1;
-        if(!active)break;
-        PollFd delay={-1,0,0};f->poll(&delay,1,50);
+    c->result=0;c->state=1;
+    if(!civ_persistent_slice(&s,fd))c->result=BAD;
+    if(c->stop||c->result) {
+        civ_clients_close(&s);
+        f->close(fd);c->listener_fd=-1;
     }
     c->state=c->result?3:2;return (void *)(u64)c->result;
 }

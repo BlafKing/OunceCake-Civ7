@@ -4,9 +4,16 @@ const net = require('node:net');
 const { success, cleanup } = require('./protocol.cjs');
 const { createFs } = require('./fs.cjs');
 
+// The Civ7 (slapah) port serves the memory endpoint over TCP loopback
+// ("127.0.0.1:<port>"); upstream ns2jb uses a filesystem socket path. Handle both.
+function connectTarget(socketPath) {
+  const match = /^([^:]+):(\d+)$/.exec(socketPath);
+  return match ? { host: match[1], port: Number(match[2]) } : socketPath;
+}
+
 function requestOnce(socketPath, command) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(socketPath);
+    const socket = net.createConnection(connectTarget(socketPath));
     let input = '';
     socket.setEncoding('utf8');
     socket.setTimeout(60000, () => {
@@ -103,7 +110,7 @@ async function openServiceWithFallback({ s, sm, name }) {
 }
 
 //attach to run from ns2jb, get handles for it's stuff
-async function attachGame(run) {
+async function attachGame(run, { bulkDownloads = false } = {}) {
   const engine = path.join(run, 'switch2');
   const read = (file) => fs.readFile(file, 'utf8').then(JSON.parse);
   const current = await read(path.join(engine, 'current-acquisition.json'));
@@ -114,10 +121,13 @@ async function attachGame(run) {
   const original = await request(current.socketPath, { command: 'root-native-info' });
   const sm = original.services?.find((item) => item.sm)?.sm;
 
-  const s = new Session('game-attach-' + Date.now(), 0x80000);
+  // Host FTP can use the connector's verified 4 MiB download path. Its receive
+  // buffer begins at base+0x6000, so reserve enough owned memory for that span.
+  const s = new Session('game-attach-' + Date.now(), bulkDownloads ? 0x408000 : 0x80000);
   s.record = async () => {};
   try {
     await s.initialize();
+    s.bulkDownloads = bulkDownloads;
     const root = domain.oneHandle(success(await domain.send(
       s, 'Clone held promoted FS root', proof.rootHandle, domain.wire.control(2),
     ), 'Clone held promoted FS root'));

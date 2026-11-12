@@ -1,6 +1,6 @@
 #ifndef NS2_FTP_NATIVE_H
 #define NS2_FTP_NATIVE_H
-#define FTP_MAX_CLIENTS 12
+#define FTP_MAX_CLIENTS 8
 #define TAR_OUTPUT_BYTES 0x40000
 #define NODE_TAR 2u
 typedef unsigned char u8;
@@ -24,8 +24,8 @@ typedef struct {
     int (*get_errno)(void);
     u32 (*ipc)(void *, u64, u32);
     u32 (*close_handle)(u32);
-    int (*thread_create)(u64 *, void *, void *(*)(void *), void *);
-    int (*thread_join)(u64, void **);
+    void *reserved0;
+    void *reserved1;
 } FtpFunctions;
 // kinds: 0 = held storage, 1 = held filesystem, 2 = storage by path, 3 = filesystem by path
 typedef struct {
@@ -58,10 +58,19 @@ typedef struct FtpConfigTag {
     u8 *data; u64 data_bytes;
     u8 *ipc_buffer;
     u64 output_bytes;
-    u8 reserved_config[88]; // padding to align with layout from ftp.cjs
+    // First-failure telemetry for the Civ7 backend. These fields live
+    // in the configuration padding, so the established wire ABI and all
+    // following offsets remain unchanged.
+    volatile u32 diagnostic, packet0, packet1, packet_at, packet_word, diagnostic_padding;
+    volatile u64 expected, actual;
+    volatile u64 sessions;
+    volatile int listener_fd;
+    u32 transfer_cursor;
+    volatile u64 closed_sessions;
+    u8 reserved_config[24]; // padding to align with layout from ftp.cjs
     volatile u32 io_lock; u32 padding;
     u8 *slots; u64 slot_bytes;
-    struct FtpConfigTag *owner;
+    u64 reserved_owner;
 } FtpConfig;
 _Static_assert(sizeof(Address) == 16 && sizeof(PollFd) == 8 && sizeof(Node) == 48, "wire ABI");
 _Static_assert(sizeof(Source) == 24, "source ABI");

@@ -5,16 +5,16 @@ const { titleId, withCleanup } = require('./engine/protocol.cjs');
 const { attachGame } = require('./engine/session.cjs');
 const { discoverGames } = require('./engine/content.cjs');
 const { prepareGame } = require('./engine/mounts.cjs');
-const { deployFtp, readImage } = require('./engine/ftp.cjs');
+const { deployCiv7Ftp, readCiv7Image } = require('./engine/civ7-ftp.cjs');
 
-const USAGE = 'Usage: node ouncecake.cjs <run-directory> [title-id] [--port 2121] [--tar]\n' +
+const FTP_PORT = 2121;
+const USAGE = 'Usage: node ouncecake.cjs <run-directory> [title-id] [--tar]\n' +
               'Use the run dir given by ns2jb (Run folder: <whatever>)\n' +
               'You can also provide a title ID to skip the selection menu and just mount a specific game\n' +
               '--tar exposes the data as tar files instead of raw files, allowing for faster downloads\n';
 
 function getArgs(argv) {
   const args = [];
-  let port = 2121;
   let tar = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -26,14 +26,6 @@ function getArgs(argv) {
 
     if (a === '--tar') {
       tar = true;
-      continue;
-    }
-
-    if (a === '--port') {
-      port = Number(argv[++i]);
-      if (!Number.isInteger(port) || port < 1024 || port > 65535) {
-        throw new Error('Invalid --port value\n' + USAGE);
-      }
       continue;
     }
 
@@ -53,7 +45,7 @@ function getArgs(argv) {
   }
 
   const title = args.length === 2 ? titleId(args[1]) : undefined;
-  return { run: path.resolve(args[0]), title, port, tar };
+  return { run: path.resolve(args[0]), title, tar };
 }
 
 const storageNames = { 2: 'Game card', 4: 'Internal', 5: 'SD' };
@@ -123,31 +115,50 @@ async function main(argv = process.argv.slice(2)) {
     console.log(USAGE);
     return;
   }
-  const image = await readImage();
-  const { port, run } = options;
+  const { run } = options;
   let { title } = options;
   const cancellation = new AbortController();
-  const stop = () => cancellation.abort();
+  let stopping = false;
+  const stop = () => {
+    if (!stopping) console.log('\nStopping FTP server...');
+    stopping = true;
+    cancellation.abort();
+  };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   let attachment;
   let server;
   await withCleanup(async () => {
-    attachment = await attachGame(run);
+    attachment = await attachGame(run, { bulkDownloads: false });
     const shouldStop = () => cancellation.signal.aborted;
     if (!title) {
       const selected = await pickGame(await discoverGames({ ...attachment, shouldStop }), cancellation.signal);
       if (!selected || shouldStop()) return;
       title = selected.title;
     }
-    const prepared = await prepareGame({ attachment, title, shouldStop, tar: options.tar });
+    const prepared = await prepareGame({
+      attachment,
+      title,
+      shouldStop,
+      tar: options.tar,
+      defer: true,
+    });
     if (shouldStop()) return;
-    server = await deployFtp({ attachment, image, ...prepared, port });
-    console.log('FTP up! ftp://<switch 2 ip>:' + port);
-    console.log('Ctrl-C to stop the server');
+    console.log('Starting Civ7 FTP server...');
+    server = await deployCiv7Ftp({
+      attachment,
+      image: await readCiv7Image(),
+      ...prepared,
+      port: FTP_PORT,
+    });
+    console.log('FTP server ready: ftp://<Switch 2 IP>:' + FTP_PORT);
+    console.log('Press Ctrl-C to stop.');
     
-    while (!shouldStop()) {
+    while (!shouldStop() && !server?.finished) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    if (server?.finished && !shouldStop()) {
+      console.log('FTP server stopped unexpectedly; cleaning up.');
     }
   }, () => server?.close(), () => attachment?.close(), () => {
     process.removeListener('SIGINT', stop);

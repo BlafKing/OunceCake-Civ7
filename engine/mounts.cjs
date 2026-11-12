@@ -529,7 +529,7 @@ function buildIndex(views, { tar = false } = {}) {
   return bytes;
 }
 
-async function prepareGame({ attachment: a, title, shouldStop = () => false, tar = false }) {
+async function prepareGame({ attachment: a, title, shouldStop = () => false, tar = false, defer = true }) {
   const views = [];
   const sources = [];
   const absentSources = [];
@@ -640,8 +640,8 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
 
     const mount = sources.length;
     // composed stuff (i.e game updates mounted on base games) and codefs need to stay mounted
-    const deferredFilesystem = mounted.kind === 'filesystem' && section !== 'exefs' && !mounted.composed;
-    const deferredStorage = mounted.kind === 'storage' &&
+    const deferredFilesystem = defer && mounted.kind === 'filesystem' && section !== 'exefs' && !mounted.composed;
+    const deferredStorage = defer && mounted.kind === 'storage' &&
       mounted.source.selection !== 'datapatch' &&
       !(mounted.source.selection === 'update' && mounted.source.contentType === 1);
     const deferred = deferredFilesystem || deferredStorage;
@@ -683,7 +683,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
     return grouped.values();
   }
 
-  async function mountPackage(prefix, candidates) {
+  async function mountPackage(prefix, candidates, baseProgramIndexes) {
     const contents = new Map();
     for (const candidate of candidates) {
       const record = candidate.dataPatch || candidate.dlc || candidate.update || candidate.base;
@@ -703,6 +703,14 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
       if ((contentType === 1 || contentType === 2) &&
           contents.has(programIndex + ':1') && contents.has(programIndex + ':2')) {
         path += contentType === 1 ? '/program' : '/data';
+      }
+      // An update Program NCA must be composed with the base Program NCA at the
+      // same index. Some installed updates advertise additional program indices
+      // which are absent from their base package. Do not abort preparation (or
+      // incorrectly fall back to base index 0); expose everything else instead.
+      if (contentType === 1 && baseProgramIndexes && !baseProgramIndexes.has(programIndex)) {
+        console.warn('Skipping ' + path + ': no matching base program exists for update index ' + programIndex);
+        continue;
       }
       const sections = [
         ['meta'], ['romfs', 'exefs', 'logo'], ['romfs'], ['control'], ['manual'], ['legal'],
@@ -742,11 +750,14 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
   const dataPatches = await discoverDataPatches({ ...a, title });
   const [baseGroup] = groups(bases);
   if (!baseGroup) throw new Error('No installed base content was found');
+  const baseProgramIndexes = new Set(baseGroup.flatMap(base => base.contents)
+    .filter(content => content.contentType === 1)
+    .map(content => content.programIndex));
   await mountPackage('/base', baseGroup.map(base => ({ storage: base.storage, base })));
 
   for (const group of groups(updates)) {
     await mountPackage('/updates/' + group[0].version,
-      group.map(update => ({ storage: update.storage, update })));
+      group.map(update => ({ storage: update.storage, update })), baseProgramIndexes);
   }
 
   // if base is fucky, try update. might be sparse.
@@ -834,7 +845,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
     }
   }
 
-  return { index: buildIndex(views, { tar }), sources };
+  return { index: buildIndex(views, { tar }), sources, views };
 }
 
 module.exports = { prepareGame, readRomfs, buildIndex };

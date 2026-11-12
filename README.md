@@ -1,8 +1,8 @@
-# OunceCake
+# OunceCake-Civ7
 
 (`ozdumptool` if you're ***lame*** and ***boring***) 
 
-Tool to dump unencrypted romFS and exeFS for Switch 2 games, updates and DLC.
+Tool to dump unencrypted romFS and exeFS for Switch 2 games, updates and DLC, modified to work with Civilization 7
 
 Supports digital games, game cards, Switch 2 Editions, etc.
 (For NSO titles, make sure the title has been opened recently before you attempt to mount it, otherwise the mount will fail.)
@@ -13,20 +13,43 @@ For the love of God, do NOT share any files you rip using this tool. It is to be
 
 ## Usage
 
+This tool has been tested with [civswitch-kit](https://gitee.com/mza1010/civswitch-kit/)
+
 0. Take note of your Switch 2's local IP address. It can be found in the network settings.
 
 1. Clone the repo: 
 ``` 
-git clone https://github.com/misshexa66/OunceCake.git
+git clone https://github.com/BlafKing/OunceCake-Civ7.git
 ```
 
-2. Use kurumuz's fork of the [ns2jb exploit](https://gitlab.com/kurumuz/ns2jb) to get an RPC connection with the system. Use `node run.cjs --rpc`.
+2. Use [civswitch-kit](https://gitee.com/mza1010/civswitch-kit/) to get an RPC connection with the system. Use `node run.cjs --rpc`.
 
-3. Run `node ouncecake.cjs <path-to-ns2jb-run>`. The output from ns2jb will tell you where this path is. (`Run folder: /home/hexa/projects/ns2jb2/runs/switch2-Icu7Jd`)
+<details>
+<summary>How to use civswitch-kit</summary>
+
+1. Clone the repo:
+```
+git clone https://gitee.com/mza1010/civswitch-kit.git
+```
+
+2. Run `set-pc-ip.ps1 <Your local PC IP>`
+   On Unix, you can manually set your ip in the `port/civ_bridge.js` file.
+
+3. Open a terminal in the `port` directory and run `node engine/run.cjs --rpc <PC Port>`
+
+4. Open a second terminal in the main directory and run `python3 save-tools/send_js.py <Switch Port> port/civ_bridge.js`
+
+5. Wait until the first terminal window successfully runs the exploit, if it fails, try again.
+
+6. Take note of the `Run folder:` logged in the first terminal window when successfull.
+
+</details>
+
+3. Run `node ouncecake.cjs <Path to run folder>`. The output from civswitch-kit will tell you where this path is. (`Run folder: /home/tom/civswitch-kit/port/engine/runs/switch2-ZUnUMZ`)
 
 4. OunceCake will prompt you to pick a game. Pick one, then wait.
 
-5. When OunceCake says `FTP up! ftp://<switch 2 ip>:2121`, use an FTP client to connect to your Switch 2's local IP address with port 2121. A username and password is not required. (Make sure your FTP client has its transfer mode set to Binary/Image/TYPE I.)
+5. When OunceCake says `FTP server ready: ftp://<Switch 2 IP>:2121`, use an FTP client to connect to your Switch 2's local IP address with port 2121. A username and password is not required. (Make sure your FTP client has its transfer mode set to Binary/Image/TYPE I.)
 
 ## Tar Mode
 

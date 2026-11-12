@@ -1,8 +1,8 @@
 typedef struct {
     FtpConfig *c;
     int fd;
-    u32 used;
-    u64 position, restart;
+    u32 used, limited;
+    u64 position, restart, end;
 } TarOutput;
 typedef struct {
     Server *s;
@@ -40,6 +40,8 @@ static int tar_emit(TarOutput *out,const u8 *data,u64 bytes) {
     u64 skip=out->position<out->restart?out->restart-out->position:0;
     if(skip>bytes)skip=bytes;
     out->position+=skip;bytes-=skip;if(data)data+=skip;
+    if(out->position>=out->end) {out->limited=1;return !out->c->stop;}
+    if(bytes>out->end-out->position) {bytes=out->end-out->position;out->limited=1;}
     while(bytes&&!out->c->stop) {
         u64 count=out->c->output_bytes-out->used;if(count>bytes)count=bytes;
         u8 *target=out->c->ipc_buffer+8192+out->used;
@@ -47,6 +49,7 @@ static int tar_emit(TarOutput *out,const u8 *data,u64 bytes) {
         out->used+=(u32)count;out->position+=count;bytes-=count;
         if(out->used==out->c->output_bytes&&!tar_flush(out))return 0;
     }
+    if(out->position==out->end)out->limited=1;
     return !bytes&&!out->c->stop;
 }
 
@@ -90,37 +93,48 @@ static int tar_chunk(TarReader *reader,const TarMember *m,FsObject *file,u64 off
     if(*bytes>s->cache_bytes-*inside)*bytes=s->cache_bytes-*inside;
     return 1;
 }
-static int tar_transfer(Server *s,const Node *archive,int fd,u64 restart) {
+// Generate at most `limit` bytes of an archive. Reconstructing the tar stream
+// from an absolute offset lets the host renew its native call while the FTP
+// data socket remains open, without retaining filesystem objects across calls.
+// Returns 0 on failure, 1 when paused, and 2 when the archive is complete.
+static int tar_transfer_slice(Server *s,const Node *archive,int fd,u64 restart,u64 limit,u64 *next) {
     FtpConfig *c=s->c;
-    if(c->output_bytes!=TAR_OUTPUT_BYTES||restart>archive->size)return 0;
+    if(c->output_bytes!=TAR_OUTPUT_BYTES||restart>archive->size||!limit)return 0;
     u32 first=(u32)archive->offset,count=(u32)(archive->offset>>32);
     const TarMember *members=s->members+first;
     
     u32 low=0,high=count;
     while(low<high) {u32 mid=low+(high-low)/2;if(members[mid].end<=restart)low=mid+1;else high=mid;}
-    TarOutput out={c,fd,0,low<count?members[low].start:archive->size-1024,restart};
+    u64 end=archive->size-restart<limit?archive->size:restart+limit;
+    TarOutput out={c,fd,0,0,low<count?members[low].start:archive->size-1024,restart,end};
     TarReader reader={s,archive,{0}};
     int ok=1;FsObject file={0};
-    for(u32 i=low;i<count&&ok&&!c->stop;i++) {
+    for(u32 i=low;i<count&&ok&&!c->stop&&!out.limited;i++) {
         const TarMember *m=members+i;u8 header[512];
         if(m->pax_bytes) {
             tar_header(s,m,1,header);
             ok=tar_emit(&out,header,512)&&tar_emit(&out,(const u8 *)s->strings+m->pax_offset,m->pax_bytes)&&
                 tar_emit(&out,0,tar_padded(m->pax_bytes)-m->pax_bytes);
         }
-        if(ok) {tar_header(s,m,0,header);ok=tar_emit(&out,header,512);}
+        if(ok&&!out.limited) {tar_header(s,m,0,header);ok=tar_emit(&out,header,512);}
         u64 offset=out.position<restart?restart-out.position:0;if(offset>m->size)offset=m->size;
         out.position+=offset;
-        while(ok&&offset<m->size&&!c->stop) {
+        while(ok&&offset<m->size&&!c->stop&&!out.limited) {
             u64 inside,bytes;
             ok=tar_chunk(&reader,m,&file,offset,&inside,&bytes);
-            if(ok) {ok=tar_emit(&out,c->data+inside,bytes);offset+=bytes;}
+            if(ok) {
+                u64 before=out.position;ok=tar_emit(&out,c->data+inside,bytes);
+                offset+=out.position-before;
+            }
         }
         if(file.handle) {if(!close_reader_object(c,file))ok=0;file=(FsObject){0};}
-        if(ok)ok=tar_emit(&out,0,tar_padded(m->size)-m->size);
+        if(ok&&!out.limited)ok=tar_emit(&out,0,tar_padded(m->size)-m->size);
     }
-    if(ok)ok=tar_emit(&out,0,1024)&&tar_flush(&out)&&out.position==archive->size;
+    if(ok&&!out.limited)ok=tar_emit(&out,0,1024);
+    if(ok)ok=tar_flush(&out);
     const Source *source=c->sources+archive->mount;
     if(reader.object.handle&&source->kind>=2&&!close_reader_object(c,reader.object))ok=0;
-    return ok&&!c->stop;
+    *next=out.position;
+    if(!ok||c->stop||out.position<restart||out.position>archive->size)return 0;
+    return out.position==archive->size?2:1;
 }
