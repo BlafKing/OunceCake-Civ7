@@ -35,9 +35,9 @@ git clone https://gitee.com/mza1010/civswitch-kit.git
 2. Run `set-pc-ip.ps1 <Your local PC IP>`
    On Unix, you can manually set your ip in the `port/civ_bridge.js` file.
 
-3. Open a terminal in the `port` directory and run `node engine/run.cjs --rpc <PC Port>`
+3. Open a terminal in the `port` directory and run `node engine/run.cjs --rpc <PC Local IP>`
 
-4. Open a second terminal in the main directory and run `python3 save-tools/send_js.py <Switch Port> port/civ_bridge.js`
+4. Open a second terminal in the main directory and run `python3 save-tools/send_js.py <Switch Local IP> port/civ_bridge.js`
 
 5. Wait until the first terminal window successfully runs the exploit, if it fails, restart the console and try again.
 
