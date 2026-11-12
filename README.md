@@ -39,7 +39,7 @@ git clone https://gitee.com/mza1010/civswitch-kit.git
 
 4. Open a second terminal in the main directory and run `python3 save-tools/send_js.py <Switch Port> port/civ_bridge.js`
 
-5. Wait until the first terminal window successfully runs the exploit, if it fails, try again.
+5. Wait until the first terminal window successfully runs the exploit, if it fails, restart the console and try again.
 
 6. Take note of the `Run folder:` logged in the first terminal window when successfull.
 
